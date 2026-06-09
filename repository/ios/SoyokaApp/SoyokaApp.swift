@@ -178,9 +178,16 @@ struct AppReducer {
                     // AI処理完了を監視し、完了したら通知を中継
                     .run { [aiProcessingQueue] send in
                         for await status in aiProcessingQueue.observeStatus(memo.id) {
-                            if case .completed = status {
+                            switch status {
+                            case .completed:
                                 await send(.aiProcessingCompleted(memo.id))
-                                break
+                                return
+                            case .failed:
+                                // 失敗時はトーストを「整えました」にせず監視を終了する
+                                // （リトライ導線はきおく詳細画面側に委ねる）
+                                return
+                            case .idle, .queued, .processing:
+                                continue
                             }
                         }
                     }

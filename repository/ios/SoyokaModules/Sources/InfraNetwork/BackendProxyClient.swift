@@ -497,6 +497,8 @@ extension BackendProxyClient {
                 let url = baseURL.appendingPathComponent("api/v1/ai/process")
                 var request = URLRequest(url: url)
                 request.httpMethod = "POST"
+                // 設計書 02-ai-pipeline.md: クラウドAI処理は30秒タイムアウト
+                request.timeoutInterval = 30
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 

@@ -9,6 +9,12 @@ import SharedUtil
 @Reducer
 public struct MemoDetailReducer {
 
+    // MARK: - Constants
+
+    /// AI整理のステータスがこの時間更新されなかった場合に
+    /// 「いつもより時間がかかっています」+ 中断導線を表示する
+    static let aiStallThreshold: Duration = .seconds(30)
+
     // MARK: - State
 
     @ObservableState
@@ -42,6 +48,15 @@ public struct MemoDetailReducer {
 
         // AI処理ステータス
         public var aiProcessingStatus: AIProcessingStatus = .idle
+
+        /// AI整理が長引いている（最後のステータス更新から aiStallThreshold 経過）
+        /// true の間は処理中表示に「中断する」導線を出す
+        public var isAIProcessingStalled: Bool = false
+
+        /// ユーザーが中断を要求した直後かどうか
+        /// キューからの「キャンセルされました」failed 通知を idle に読み替えて、
+        /// ユーザー操作による中断を失敗として表示しないために使う
+        public var isAICancelRequested: Bool = false
 
         // UIレベルのリトライ回数（再生成ボタン押下回数を追跡し上限を設ける）
         public var aiRetryCount: Int = 0
@@ -99,6 +114,8 @@ public struct MemoDetailReducer {
             deleteState: MemoDeleteReducer.State = .init(),
             audioPlayer: AudioPlayerReducer.State? = nil,
             aiProcessingStatus: AIProcessingStatus = .idle,
+            isAIProcessingStalled: Bool = false,
+            isAICancelRequested: Bool = false,
             aiRetryCount: Int = 0,
             remainingQuota: Int = 10,
             quotaLimit: Int = 10,
@@ -136,6 +153,8 @@ public struct MemoDetailReducer {
             self.deleteState = deleteState
             self.audioPlayer = audioPlayer
             self.aiProcessingStatus = aiProcessingStatus
+            self.isAIProcessingStalled = isAIProcessingStalled
+            self.isAICancelRequested = isAICancelRequested
             self.aiRetryCount = aiRetryCount
             self.remainingQuota = remainingQuota
             self.quotaLimit = quotaLimit
@@ -223,6 +242,10 @@ public struct MemoDetailReducer {
         case backButtonTapped
         case regenerateAISummary
         case aiProcessingStatusUpdated(AIProcessingStatus)
+        /// AI整理が長引いていることを検知した（内部タイマー発火）
+        case _aiProcessingStallDetected
+        /// 長引いているAI整理の「中断する」ボタンタップ
+        case cancelAIProcessingButtonTapped
         /// AI要約カードの展開/折りたたみトグル（T10）
         case toggleSummaryExpanded
         /// AI分析を手動トリガーする（未生成時のプレースホルダからの呼び出し）
@@ -317,6 +340,7 @@ public struct MemoDetailReducer {
 
     private enum CancelID {
         case aiObserve
+        case aiStallTimer
     }
 
     // MARK: - Dependencies
@@ -330,6 +354,7 @@ public struct MemoDetailReducer {
     @Dependency(\.subscriptionClient) var subscriptionClient
     @Dependency(\.uuid) var uuid
     @Dependency(\.analyticsClient) var analyticsClient
+    @Dependency(\.continuousClock) var clock
 
     public init() {}
 
@@ -515,7 +540,34 @@ public struct MemoDetailReducer {
                 return .none
 
             case let .aiProcessingStatusUpdated(status):
+                var status = status
+                // ユーザーが中断した直後の failed 通知は「失敗」ではなく未実行（idle）として扱う
+                if state.isAICancelRequested, case .failed = status {
+                    status = .idle
+                    state.isAICancelRequested = false
+                }
+                if case .completed = status {
+                    state.isAICancelRequested = false
+                }
                 state.aiProcessingStatus = status
+
+                // ストール検知: 処理中ステータスが aiStallThreshold の間更新されなければ
+                // _aiProcessingStallDetected を発火して中断導線を表示する。
+                // ステータスが進むたびにタイマーを張り直し、完了・失敗・idle で解除する
+                let stallMonitorEffect: Effect<Action>
+                switch status {
+                case .queued, .processing:
+                    state.isAIProcessingStalled = false
+                    stallMonitorEffect = .run { send in
+                        try await clock.sleep(for: Self.aiStallThreshold)
+                        await send(._aiProcessingStallDetected)
+                    }
+                    .cancellable(id: CancelID.aiStallTimer, cancelInFlight: true)
+                case .idle, .completed, .failed:
+                    state.isAIProcessingStalled = false
+                    stallMonitorEffect = .cancel(id: CancelID.aiStallTimer)
+                }
+
                 if case .completed = status {
                     // AI処理成功時はリトライカウントをリセット
                     state.aiRetryCount = 0
@@ -540,6 +592,7 @@ public struct MemoDetailReducer {
                     // AI処理完了時はメモ詳細を再読み込み + クォータ情報更新
                     let memoID = state.memoID
                     return .merge(
+                        stallMonitorEffect,
                         .run { send in
                             let result = await Result {
                                 try await self.loadDetail(memoID: memoID)
@@ -553,11 +606,27 @@ public struct MemoDetailReducer {
                         } catch: { _, _ in }
                     )
                 }
-                if case .failed(.networkError) = status {
-                    // ネットワークエラー時はオフラインフォールバック案内のみ（自動リトライなし）
-                    return .none
-                }
+                return stallMonitorEffect
+
+            case ._aiProcessingStallDetected:
+                state.isAIProcessingStalled = true
                 return .none
+
+            case .cancelAIProcessingButtonTapped:
+                // UX原則: 操作にすぐ反応を返す。表示は即座に待機状態へ戻し、
+                // キューへのキャンセル要求はバックグラウンドで行う
+                state.isAIProcessingStalled = false
+                state.isAICancelRequested = true
+                state.aiProcessingStatus = .idle
+                let memoID = state.memoID
+                return .merge(
+                    .cancel(id: CancelID.aiStallTimer),
+                    .run { _ in
+                        try await self.aiProcessingQueue.cancelProcessing(memoID)
+                    } catch: { _, _ in
+                        // キャンセル要求自体の失敗は無視（表示は既に idle に戻している）
+                    }
+                )
 
             // T09: AI要約の再生成（初回はオンボーディング表示）
             case .regenerateAISummary:
@@ -577,6 +646,7 @@ public struct MemoDetailReducer {
 
                 state.aiRetryCount += 1
                 state.aiProcessingStatus = .queued
+                state.isAICancelRequested = false
                 let memoID = state.memoID
                 return .run { send in
                     try await self.aiProcessingQueue.enqueueProcessing(memoID)
@@ -618,6 +688,7 @@ public struct MemoDetailReducer {
                 }
 
                 state.aiProcessingStatus = .queued
+                state.isAICancelRequested = false
                 let memoID = state.memoID
                 return .run { send in
                     try await self.aiProcessingQueue.enqueueProcessing(memoID)

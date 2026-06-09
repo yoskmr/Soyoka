@@ -21,6 +21,14 @@ private let logger = Logger(subsystem: "app.soyoka", category: "AIProcessingQueu
 /// enqueueProcessing → canProcess確認 → LLM推論 → 結果保存 → recordUsage → ステータス通知
 public final class AIProcessingQueueLive: @unchecked Sendable {
 
+    // MARK: - Constants
+
+    /// LLM推論1試行あたりのタイムアウト
+    /// オンデバイス推論（LanguageModelSession）にはタイムアウト機構がなく、
+    /// ハングすると `.processing` のままステータスが進まなくなるため、
+    /// 一定時間で打ち切って `.failed` を通知し、UIにリトライ導線を出す
+    static let llmProcessTimeout: Duration = .seconds(120)
+
     // MARK: - Properties
 
     private let modelContainer: ModelContainer
@@ -340,6 +348,21 @@ public final class AIProcessingQueueLive: @unchecked Sendable {
 
         } catch is CancellationError {
             logger.info("AI処理がキャンセルされました: memoId=\(memoId)")
+
+            // LLMモデルをアンロード（キャンセル時もメモリ解放）
+            await llmProvider.unloadModel()
+
+            // キャンセル時もステータスを確定させる。
+            // lastStatus が .processing のまま残ると、後から購読した画面が
+            // 永遠に「ことばを整えています…」を表示し続けるため
+            try? await updateTaskStatus(
+                memoId: memoId,
+                status: AIProcessingTaskModel.Status.cancelled
+            )
+            notifyStatus(
+                memoId: memoId,
+                status: .failed(.processingFailed("キャンセルされました"))
+            )
         } catch {
             logger.error("AI処理失敗: memoId=\(memoId), error=\(error.localizedDescription)")
 
@@ -375,7 +398,9 @@ public final class AIProcessingQueueLive: @unchecked Sendable {
         for attempt in 0...maxRetries {
             do {
                 try Task.checkCancellation()
-                let response = try await llmProvider.process(request)
+                let response = try await Self.withTimeout(Self.llmProcessTimeout) { [llmProvider] in
+                    try await llmProvider.process(request)
+                }
                 return response
             } catch let error as LLMError where error == .invalidOutput && attempt < maxRetries {
                 lastError = error
@@ -396,6 +421,31 @@ public final class AIProcessingQueueLive: @unchecked Sendable {
         }
 
         throw lastError ?? LLMError.invalidOutput
+    }
+
+    /// 指定時間内に operation が完了しなければ `LLMError.processingFailed` を投げる
+    ///
+    /// 注意: タイムアウト時は operation にキャンセルを送るが、キャンセル非対応の処理は
+    /// 裏で実行が続く可能性がある。その場合でもステータス通知は先行して failed になるため、
+    /// UI が処理中表示のまま固まることはない
+    private static func withTimeout<T: Sendable>(
+        _ timeout: Duration,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                try await operation()
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw LLMError.processingFailed("AI整理が時間内に完了しませんでした")
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else {
+                throw LLMError.processingFailed("AI整理が時間内に完了しませんでした")
+            }
+            return result
+        }
     }
 
     // MARK: - SwiftData Operations

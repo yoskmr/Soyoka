@@ -313,6 +313,8 @@ final class MemoDetailAIIntegrationTests: XCTestCase {
             $0.aiQuota.monthlyLimit = { 10 }
             $0.subscriptionClient.currentSubscription = { .free }
             $0.relatedMemo.findRelated = { _, _, _ in [] }
+            // queued/processing 受信でストール検知タイマーが起動するためクロックを差し替える
+            $0.continuousClock = TestClock()
         }
         // exhaustivity = .off: onAppear の並行エフェクト（memoLoaded + observeStatus + quotaInfoLoaded + subscriptionCheck）の順序が非決定的なため
         store.exhaustivity = .off

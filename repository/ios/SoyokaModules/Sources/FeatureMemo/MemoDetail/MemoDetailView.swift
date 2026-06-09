@@ -32,10 +32,44 @@ public struct MemoDetailView: View {
 
                     // AI処理中: 美しいアニメーション表示
                     if isAIProcessing(store.aiProcessingStatus) && store.aiSummary == nil {
-                        AIProcessingAnimationView()
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, VMDesignTokens.Spacing.xxl)
-                            .transition(.opacity)
+                        VStack(spacing: VMDesignTokens.Spacing.md) {
+                            AIProcessingAnimationView()
+
+                            // 長引いている時だけ中断導線を出す
+                            // UX原則: 待ち時間が発生する場合でも中断・キャンセルできるようにする
+                            if store.isAIProcessingStalled {
+                                VStack(spacing: VMDesignTokens.Spacing.sm) {
+                                    Text("いつもより時間がかかっています…")
+                                        .font(.vmCaption1)
+                                        .foregroundColor(.vmTextTertiary)
+                                    Button {
+                                        store.send(.cancelAIProcessingButtonTapped)
+                                    } label: {
+                                        Text("中断する")
+                                            .font(.vmCallout)
+                                            .foregroundColor(.vmPrimary)
+                                    }
+                                    .accessibilityLabel("AI整理を中断する")
+                                }
+                                .transition(.opacity)
+                            }
+
+                            // 整理を待つ間も本人のことばを読めるようにする
+                            // UX原則: 画面は完成を待たず、表示できる部分から順に見せる
+                            if !store.transcriptionText.isEmpty {
+                                Text(store.transcriptionText)
+                                    .font(.vmBody())
+                                    .foregroundColor(.vmTextSecondary)
+                                    .lineSpacing(VMDesignTokens.LineSpacing.body)
+                                    .lineLimit(8)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.top, VMDesignTokens.Spacing.md)
+                            }
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, VMDesignTokens.Spacing.xxl)
+                        .transition(.opacity)
+                        .animation(.easeOut(duration: 0.3), value: store.isAIProcessingStalled)
                     }
                     // AI要約セクション（シンプル版）— 処理中でなければ表示
                     else {

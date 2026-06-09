@@ -558,4 +558,112 @@ final class MemoDetailReducerTests: XCTestCase {
             $0.aiProcessingStatus = .completed(isOnDevice: true)
         }
     }
+
+    // MARK: - Test 17: AI整理ストール検知（処理が長引いた場合の中断導線）
+
+    func test_aiProcessingStatusUpdated_処理中のまま閾値経過_ストール検知される() async {
+        let clock = TestClock()
+        let store = TestStore(
+            initialState: MemoDetailReducer.State(memoID: testMemoID)
+        ) {
+            MemoDetailReducer()
+        } withDependencies: {
+            $0.continuousClock = clock
+        }
+
+        await store.send(.aiProcessingStatusUpdated(
+            .processing(progress: 0.5, description: "きおくを整理中...")
+        )) {
+            $0.aiProcessingStatus = .processing(progress: 0.5, description: "きおくを整理中...")
+        }
+
+        await clock.advance(by: MemoDetailReducer.aiStallThreshold)
+
+        await store.receive(._aiProcessingStallDetected) {
+            $0.isAIProcessingStalled = true
+        }
+    }
+
+    func test_aiProcessingStatusUpdated_ステータス進展でタイマー張り直し_failedで停止() async {
+        let clock = TestClock()
+        let store = TestStore(
+            initialState: MemoDetailReducer.State(memoID: testMemoID)
+        ) {
+            MemoDetailReducer()
+        } withDependencies: {
+            $0.continuousClock = clock
+        }
+
+        await store.send(.aiProcessingStatusUpdated(
+            .processing(progress: 0.3, description: "LLMモデルを準備中...")
+        )) {
+            $0.aiProcessingStatus = .processing(progress: 0.3, description: "LLMモデルを準備中...")
+        }
+
+        // 閾値の半分でステータスが進展 → タイマーが張り直される
+        await clock.advance(by: .seconds(15))
+        await store.send(.aiProcessingStatusUpdated(
+            .processing(progress: 0.5, description: "きおくを整理中...")
+        )) {
+            $0.aiProcessingStatus = .processing(progress: 0.5, description: "きおくを整理中...")
+        }
+
+        // 最初のステータスから30秒経過してもストール検知されない（タイマー張り直し済み）
+        await clock.advance(by: .seconds(15))
+
+        // failed でタイマー停止 → 以降時間が経ってもストール検知されない
+        await store.send(.aiProcessingStatusUpdated(
+            .failed(.processingFailed("テストエラー"))
+        )) {
+            $0.aiProcessingStatus = .failed(.processingFailed("テストエラー"))
+        }
+        await clock.advance(by: .seconds(60))
+    }
+
+    // MARK: - Test 18: AI整理の中断
+
+    func test_cancelAIProcessingButtonTapped_キャンセル要求しidleに戻る() async {
+        let cancelledMemoID = LockIsolated<UUID?>(nil)
+        let store = TestStore(
+            initialState: MemoDetailReducer.State(
+                memoID: testMemoID,
+                aiProcessingStatus: .processing(progress: 0.5, description: "きおくを整理中..."),
+                isAIProcessingStalled: true
+            )
+        ) {
+            MemoDetailReducer()
+        } withDependencies: {
+            $0.aiProcessingQueue.cancelProcessing = { id in
+                cancelledMemoID.withValue { $0 = id }
+            }
+        }
+
+        await store.send(.cancelAIProcessingButtonTapped) {
+            $0.isAIProcessingStalled = false
+            $0.isAICancelRequested = true
+            $0.aiProcessingStatus = .idle
+        }
+
+        XCTAssertEqual(cancelledMemoID.value, testMemoID)
+    }
+
+    func test_aiProcessingStatusUpdated_中断要求後のfailed通知_idleに読み替える() async {
+        let store = TestStore(
+            initialState: MemoDetailReducer.State(
+                memoID: testMemoID,
+                aiProcessingStatus: .processing(progress: 0.5, description: "きおくを整理中..."),
+                isAICancelRequested: true
+            )
+        ) {
+            MemoDetailReducer()
+        }
+
+        // キュー側から届く「キャンセルされました」failed 通知は失敗ではなく未実行（idle）として扱う
+        await store.send(.aiProcessingStatusUpdated(
+            .failed(.processingFailed("キャンセルされました"))
+        )) {
+            $0.aiProcessingStatus = .idle
+            $0.isAICancelRequested = false
+        }
+    }
 }
