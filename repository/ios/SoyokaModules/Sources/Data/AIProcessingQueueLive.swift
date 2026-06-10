@@ -4,6 +4,9 @@ import Foundation
 import InfraStorage
 import os.log
 import SwiftData
+#if canImport(UIKit)
+import UIKit
+#endif
 
 private let logger = Logger(subsystem: "app.soyoka", category: "AIProcessingQueueLive")
 
@@ -28,6 +31,9 @@ public final class AIProcessingQueueLive: @unchecked Sendable {
     /// ハングすると `.processing` のままステータスが進まなくなるため、
     /// 一定時間で打ち切って `.failed` を通知し、UIにリトライ導線を出す
     static let llmProcessTimeout: Duration = .seconds(120)
+
+    /// 復旧時に同一きおくへ自動再実行する累計タスク数の上限（クラッシュループ防止）
+    static let maxTaskCountForRecovery = 3
 
     // MARK: - Properties
 
@@ -121,12 +127,60 @@ public final class AIProcessingQueueLive: @unchecked Sendable {
         notifyStatus(memoId: memoId, status: .queued)
 
         // 2. バックグラウンドで処理を開始
+        // つぶやき直後にホームへ戻る・他アプリへ移っても処理が即サスペンドされないよう、
+        // OSにバックグラウンド実行の猶予時間を要求して保護する
         let task = Task { [weak self] in
             guard let self else { return }
+            #if canImport(UIKit) && !os(watchOS)
+            let backgroundGuard = BackgroundTaskGuard()
+            await backgroundGuard.begin(name: "AIProcessing-\(memoId.uuidString.prefix(8))")
             await self.processTask(taskId: taskId, memoId: memoId)
+            await backgroundGuard.end()
+            #else
+            await self.processTask(taskId: taskId, memoId: memoId)
+            #endif
         }
 
         registerActiveTask(memoId: memoId, task: task)
+    }
+
+    /// アプリ起動時に、前回終了時に未完了のまま残ったタスクを復旧する
+    ///
+    /// 処理中にプロセスが終了すると SwiftData 上のタスクが queued/processing/retrying の
+    /// まま残り、そのきおくは手動で再実行しない限り整理されない。
+    /// 起動時に検出して中断タスクを失敗確定し、未整理のきおくは自動で再実行する
+    public func recoverPendingTasks() async {
+        let pendingMemoIds: [UUID]
+        do {
+            pendingMemoIds = try await fetchPendingTaskMemoIds()
+        } catch {
+            logger.error("未完了タスクの検出に失敗: \(error.localizedDescription)")
+            return
+        }
+        guard !pendingMemoIds.isEmpty else { return }
+        logger.info("未完了のAI処理タスクを復旧します: \(pendingMemoIds.count)件")
+
+        for memoId in pendingMemoIds {
+            do {
+                // 中断されたタスクを失敗確定（queued/processing のまま残さない）
+                try await markPendingTasksFailed(memoId: memoId)
+
+                // 既に整理済み・削除済みのきおくは再実行しない
+                guard let memo = try await voiceMemoRepository.fetchByID(memoId),
+                      memo.aiSummary == nil else { continue }
+
+                // クラッシュループ防止: 同一きおくへの累計実行回数に上限を設ける
+                guard try await taskCount(memoId: memoId) < Self.maxTaskCountForRecovery else {
+                    logger.warning("復旧上限に達したため再実行しません: memoId=\(memoId)")
+                    continue
+                }
+
+                try await enqueueProcessing(memoId)
+                logger.info("中断されたAI処理を再実行: memoId=\(memoId)")
+            } catch {
+                logger.error("AI処理タスクの復旧に失敗: memoId=\(memoId), error=\(error.localizedDescription)")
+            }
+        }
     }
 
     /// メモIDの処理ステータスを監視する AsyncStream
@@ -202,6 +256,9 @@ public final class AIProcessingQueueLive: @unchecked Sendable {
             },
             cancelProcessing: { [self] memoId in
                 try await self.cancelProcessing(memoId)
+            },
+            recoverPendingTasks: { [self] in
+                await self.recoverPendingTasks()
             }
         )
     }
@@ -450,6 +507,55 @@ public final class AIProcessingQueueLive: @unchecked Sendable {
 
     // MARK: - SwiftData Operations
 
+    /// 未完了（queued/processing/retrying）タスクが残っているメモIDの一覧を取得する
+    @MainActor
+    private func fetchPendingTaskMemoIds() async throws -> [UUID] {
+        let queued = AIProcessingTaskModel.Status.queued
+        let processing = AIProcessingTaskModel.Status.processing
+        let retrying = AIProcessingTaskModel.Status.retrying
+        let descriptor = FetchDescriptor<AIProcessingTaskModel>(
+            predicate: #Predicate {
+                $0.status == queued || $0.status == processing || $0.status == retrying
+            },
+            sortBy: [SortDescriptor(\.createdAt)]
+        )
+        let tasks = try context.fetch(descriptor)
+        // 順序を保ちながら重複メモIDを除去
+        var seen = Set<UUID>()
+        return tasks.compactMap { seen.insert($0.memoId).inserted ? $0.memoId : nil }
+    }
+
+    /// 指定メモの未完了タスクをすべて失敗確定する（復旧用）
+    @MainActor
+    private func markPendingTasksFailed(memoId: UUID) async throws {
+        let queued = AIProcessingTaskModel.Status.queued
+        let processing = AIProcessingTaskModel.Status.processing
+        let retrying = AIProcessingTaskModel.Status.retrying
+        let descriptor = FetchDescriptor<AIProcessingTaskModel>(
+            predicate: #Predicate {
+                $0.memoId == memoId
+                    && ($0.status == queued || $0.status == processing || $0.status == retrying)
+            }
+        )
+        let tasks = try context.fetch(descriptor)
+        guard !tasks.isEmpty else { return }
+        for task in tasks {
+            task.status = AIProcessingTaskModel.Status.failed
+            task.errorMessage = "アプリ終了により中断されました"
+            task.completedAt = Date()
+        }
+        try context.save()
+    }
+
+    /// 指定メモの累計タスク数を取得する（復旧上限の判定用）
+    @MainActor
+    private func taskCount(memoId: UUID) async throws -> Int {
+        let descriptor = FetchDescriptor<AIProcessingTaskModel>(
+            predicate: #Predicate { $0.memoId == memoId }
+        )
+        return try context.fetchCount(descriptor)
+    }
+
     /// 同一memoIdの最新タスクを取得する
     ///
     /// - Returns: 最新の AIProcessingTaskModel（タスクが存在しない場合は nil）
@@ -671,3 +777,34 @@ public final class AIProcessingQueueLive: @unchecked Sendable {
         }
     }
 }
+
+// MARK: - Background Task Protection
+
+#if canImport(UIKit) && !os(watchOS)
+/// AI整理中のバックグラウンド実行時間を確保するガード
+///
+/// 保護なしではアプリがバックグラウンドへ移ると処理が即サスペンドされ、
+/// 「ことばを整えています…」のまま進まなくなる。OSに猶予時間を要求し、
+/// 猶予が切れた場合は次回起動時の recoverPendingTasks() に復旧を委ねる
+@MainActor
+private final class BackgroundTaskGuard {
+    private var taskID: UIBackgroundTaskIdentifier = .invalid
+
+    nonisolated init() {}
+
+    func begin(name: String) {
+        guard taskID == .invalid else { return }
+        taskID = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            MainActor.assumeIsolated {
+                self?.end()
+            }
+        }
+    }
+
+    func end() {
+        guard taskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(taskID)
+        taskID = .invalid
+    }
+}
+#endif

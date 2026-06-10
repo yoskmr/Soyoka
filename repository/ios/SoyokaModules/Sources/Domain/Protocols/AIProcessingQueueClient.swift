@@ -35,15 +35,20 @@ public struct AIProcessingQueueClient: Sendable {
     public var observeStatus: @Sendable (UUID) -> AsyncStream<AIProcessingStatus>
     /// メモIDの処理をキャンセル
     public var cancelProcessing: @Sendable (UUID) async throws -> Void
+    /// アプリ起動時に、前回終了時に未完了のまま残ったタスクを復旧する
+    /// （未整理のきおくを再実行、または失敗確定してリトライ導線に乗せる）
+    public var recoverPendingTasks: @Sendable () async -> Void
 
     public init(
         enqueueProcessing: @escaping @Sendable (UUID) async throws -> Void,
         observeStatus: @escaping @Sendable (UUID) -> AsyncStream<AIProcessingStatus>,
-        cancelProcessing: @escaping @Sendable (UUID) async throws -> Void
+        cancelProcessing: @escaping @Sendable (UUID) async throws -> Void,
+        recoverPendingTasks: @escaping @Sendable () async -> Void = {}
     ) {
         self.enqueueProcessing = enqueueProcessing
         self.observeStatus = observeStatus
         self.cancelProcessing = cancelProcessing
+        self.recoverPendingTasks = recoverPendingTasks
     }
 }
 
@@ -53,7 +58,8 @@ extension AIProcessingQueueClient: TestDependencyKey {
     public static let testValue = AIProcessingQueueClient(
         enqueueProcessing: unimplemented("AIProcessingQueueClient.enqueueProcessing"),
         observeStatus: unimplemented("AIProcessingQueueClient.observeStatus", placeholder: AsyncStream { $0.finish() }),
-        cancelProcessing: unimplemented("AIProcessingQueueClient.cancelProcessing")
+        cancelProcessing: unimplemented("AIProcessingQueueClient.cancelProcessing"),
+        recoverPendingTasks: unimplemented("AIProcessingQueueClient.recoverPendingTasks")
     )
 }
 

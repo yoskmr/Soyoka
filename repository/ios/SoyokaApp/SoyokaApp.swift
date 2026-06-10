@@ -63,6 +63,8 @@ struct AppReducer {
         var settings = SettingsReducer.State()
         var forceUpdateStoreURL: URL?
         var lastForceUpdateCheck: Date?
+        /// 起動後に中断AI処理の復旧を実行済みか（起動ごとに1回だけ実行する）
+        var didRecoverPendingAITasks = false
 
         enum Tab: Hashable {
             case home
@@ -102,17 +104,31 @@ struct AppReducer {
             // MARK: - 強制アップデートチェック
 
             case .scenePhaseChanged(.active):
-                // スロットル: 前回チェックから5分未満ならスキップ
-                if let lastCheck = state.lastForceUpdateCheck,
-                   now.timeIntervalSince(lastCheck) < 300 {
-                    return .none
+                var effects: [Effect<Action>] = []
+
+                // 起動後最初のアクティブ時に、前回終了で中断されたAI処理を復旧する
+                // （processing のまま残ったタスクの失敗確定 + 未整理きおくの自動再実行）
+                if !state.didRecoverPendingAITasks {
+                    state.didRecoverPendingAITasks = true
+                    effects.append(.run { [aiProcessingQueue] _ in
+                        await aiProcessingQueue.recoverPendingTasks()
+                    })
                 }
-                state.lastForceUpdateCheck = now
-                return .run { [forceUpdateClient] send in
-                    await send(.forceUpdateCheckResponse(
-                        Result { try await forceUpdateClient.check("https://api.soyoka.app") }
-                    ))
+
+                // 強制アップデートチェック（スロットル: 前回チェックから5分未満ならスキップ）
+                let shouldCheckForceUpdate = state.lastForceUpdateCheck.map {
+                    now.timeIntervalSince($0) >= 300
+                } ?? true
+                if shouldCheckForceUpdate {
+                    state.lastForceUpdateCheck = now
+                    effects.append(.run { [forceUpdateClient] send in
+                        await send(.forceUpdateCheckResponse(
+                            Result { try await forceUpdateClient.check("https://api.soyoka.app") }
+                        ))
+                    })
                 }
+
+                return effects.isEmpty ? .none : .merge(effects)
 
             case .scenePhaseChanged:
                 return .none
