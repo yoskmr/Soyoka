@@ -1541,6 +1541,50 @@ sequenceDiagram
     end
 ```
 
+### 5.6 処理の堅牢性 — タイムアウト・復旧・バックグラウンド保護（2026-06-10追記）
+
+AI処理が「処理中」のままUIが固まる事象（LLMハング・プロセス終了・サスペンド）への対策。
+
+#### 5.6.1 LLM推論タイムアウト
+
+| 経路 | タイムアウト | 実装箇所 |
+|:-----|:-----------|:--------|
+| LLM推論1試行（オンデバイス → クラウドフォールバック含む） | 120秒 | `AIProcessingQueueLive.llmProcessTimeout` |
+| クラウドAI処理リクエスト（`/api/v1/ai/process`） | 30秒 | `BackendProxyClient`（4.4 準拠） |
+
+- オンデバイス推論（`LanguageModelSession`）にはOS側のタイムアウト機構がないため、キュー層で打ち切る
+- タイムアウト時は `.failed` ステータスを通知し、メモ詳細画面にリトライ導線を表示する
+
+#### 5.6.2 ステータス通知の完全性
+
+処理タスクはどの終了経路でも必ず終端ステータス（`.completed` / `.failed`）を通知する。
+`lastStatus` キャッシュが `.processing` のまま残ると、後から購読した画面が永遠に
+処理中表示になるため、キャンセル経路でも必ず通知する。
+
+| 終了経路 | ステータス通知 | SwiftData status |
+|:--------|:-------------|:----------------|
+| 正常完了 | `.completed(isOnDevice:)` | completed |
+| エラー / タイムアウト | `.failed(.processingFailed)` | failed |
+| キャンセル（ユーザー中断・タスクキャンセル） | `.failed(.processingFailed("キャンセルされました"))` | cancelled |
+
+#### 5.6.3 起動時復旧（recoverPendingTasks）
+
+処理中にプロセスが終了すると SwiftData 上のタスクが queued / processing / retrying の
+まま残り、そのメモは手動で再実行しない限り整理されない。
+起動後最初のフォアグラウンドアクティブ時に AppReducer から1回だけ復旧を実行する:
+
+1. 未完了（queued / processing / retrying）タスクを検出
+2. 該当タスクを失敗確定する（errorMessage: 「アプリ終了により中断されました」）
+3. メモが未整理（aiSummary == nil）かつ存在する場合は自動で再実行する
+4. 同一メモへの累計タスク数が上限（3件）に達している場合は再実行しない（クラッシュループ防止）
+
+#### 5.6.4 バックグラウンド保護
+
+- 処理開始時に `UIApplication.beginBackgroundTask` で実行猶予を要求し、録音直後に
+  ホーム画面へ戻る・他アプリへ移っても処理を継続する
+- 猶予時間切れ時はバックグラウンドタスクを返却し、5.6.3 の起動時復旧に委ねる
+- 注: 5.1 の `BGTaskScheduler`（BGProcessingTaskRequest）による再スケジュールは未実装（Phase 4 で検討）
+
 ---
 
 ## 6. プロンプトテンプレート
