@@ -218,11 +218,11 @@ struct AppReducer {
                 )
 
             case let .aiProcessingCompleted(memoID):
-                state.recording.aiProcessingCompleted = true
                 #if DEBUG
                 print("[AI] 処理完了通知: id=\(memoID.uuidString.prefix(8))")
                 #endif
-                return .none
+                // 子（RecordingFeature）に中継し、トーストの「整えました」表示と自動クローズを任せる
+                return .send(.recording(.aiProcessingCompleted))
 
             case .recording:
                 return .none

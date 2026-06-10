@@ -15,6 +15,10 @@ public struct RecordingFeature {
     public static let maxRecordingDuration: TimeInterval = 300
     /// 警告表示の閾値（残り30秒 = 270秒）
     public static let warningThreshold: TimeInterval = 270
+    /// 完了トーストの最大表示時間（AI整理が長引いても自動で閉じる。整理はバックグラウンドで継続）
+    public static let completionToastMaxDuration: Duration = .seconds(10)
+    /// AI整理完了「整えました」を見せてからトーストを閉じるまでの余韻
+    public static let completionToastLingerDuration: Duration = .seconds(2)
 
     // MARK: - State
 
@@ -118,8 +122,9 @@ public struct RecordingFeature {
         case dismissCompletion
         /// 親（AppReducer）にメモ詳細への遷移を通知
         case navigateToMemoDetail(UUID)
-        /// 完了後の自動遷移（1.5秒後にきおく詳細へ）
-        case autoNavigateToMemo
+        /// AI整理完了の通知（AppReducer から中継）
+        /// トースト表示中なら「整えました」を見せてから自動で閉じる
+        case aiProcessingCompleted
 
         // 完了画面段階アクション
         case completionStageAdvanced(RecordingFeature.State.CompletionStage)
@@ -282,7 +287,8 @@ public struct RecordingFeature {
                 return .none
 
             case let .recordingSaved(memo):
-                // 完了画面を表示（リセットはviewMemoTapped/autoNavigateToMemoで行う）
+                // 完了画面を表示（リセットはviewMemoTapped/dismissCompletionで行う）
+                // ホームに留まり、すぐ次のつぶやきができるようにする（詳細へは「きおくを見る」タップ時のみ遷移）
                 state.recordingStatus = .saved(memo)
                 state.completionStage = .initial
                 analyticsClient.send("recording.completed")
@@ -297,12 +303,12 @@ public struct RecordingFeature {
                         await send(.completionStageAdvanced(.cta))
                     }
                     .cancellable(id: CancelID.completionStage),
-                    // 1.5秒後に自動的にきおく詳細へ遷移
+                    // 最大表示時間が経過したらトーストを自動で閉じる（AI整理はバックグラウンドで継続）
                     .run { send in
-                        try await clock.sleep(for: .milliseconds(1500))
-                        await send(.autoNavigateToMemo)
+                        try await clock.sleep(for: Self.completionToastMaxDuration)
+                        await send(.dismissCompletion)
                     }
-                    .cancellable(id: CancelID.completionAutoDismiss)
+                    .cancellable(id: CancelID.completionAutoDismiss, cancelInFlight: true)
                 )
 
             case let .completionStageAdvanced(stage):
@@ -331,24 +337,17 @@ public struct RecordingFeature {
                     .send(.navigateToMemoDetail(memoID))
                 )
 
-            case .autoNavigateToMemo:
-                // 1.5秒後の自動遷移: viewMemoTapped と同じ処理
-                guard case let .saved(memo) = state.recordingStatus else {
+            case .aiProcessingCompleted:
+                state.aiProcessingCompleted = true
+                // トースト表示中なら「整えました」の余韻を見せてから自動で閉じる
+                guard case .saved = state.recordingStatus else {
                     return .none
                 }
-                let memoID = memo.id
-                state.recordingStatus = .idle
-                state.partialTranscription = ""
-                state.confirmedTranscription = ""
-                state.elapsedTime = 0
-                state.audioLevel = 0
-                state.wasAutoStopped = false
-                state.completionStage = .initial
-                state.aiProcessingCompleted = false
-                return .merge(
-                    .cancel(id: CancelID.completionStage),
-                    .send(.navigateToMemoDetail(memoID))
-                )
+                return .run { send in
+                    try await clock.sleep(for: Self.completionToastLingerDuration)
+                    await send(.dismissCompletion)
+                }
+                .cancellable(id: CancelID.completionAutoDismiss, cancelInFlight: true)
 
             case .dismissCompletion:
                 // 状態をリセットして録音画面に戻る

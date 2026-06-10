@@ -761,12 +761,99 @@ final class RecordingFeatureTests: XCTestCase {
         await store.send(.viewMemoTapped)
     }
 
+    // MARK: - 正常系: 完了トーストの自動クローズ（ホーム滞在型）
+
+    /// 保存完了後、きおく詳細へ自動遷移せず、最大表示時間でトーストが自動で閉じる
+    func test_recordingSaved_最大表示時間経過_自動遷移せずトーストが閉じる() async {
+        let memo = VoiceMemoEntity(
+            id: UUID(),
+            title: "テストメモ",
+            audioFilePath: "/Documents/Audio/test.m4a"
+        )
+        let clock = TestClock()
+        let store = TestStore(
+            initialState: RecordingFeature.State(isPermissionGranted: true)
+        ) {
+            RecordingFeature()
+        } withDependencies: {
+            $0.continuousClock = clock
+        }
+
+        await store.send(.recordingSaved(memo)) {
+            $0.recordingStatus = .saved(memo)
+        }
+
+        // 段階表示の進行（100ms + 200ms + 200ms）
+        await clock.advance(by: .milliseconds(500))
+        await store.receive(.completionStageAdvanced(.checkmark)) {
+            $0.completionStage = .checkmark
+        }
+        await store.receive(.completionStageAdvanced(.preview)) {
+            $0.completionStage = .preview
+        }
+        await store.receive(.completionStageAdvanced(.cta)) {
+            $0.completionStage = .cta
+        }
+
+        // 最大表示時間に到達 → navigateToMemoDetail ではなく dismissCompletion が発火する
+        await clock.advance(by: RecordingFeature.completionToastMaxDuration)
+        await store.receive(.dismissCompletion) {
+            $0.recordingStatus = .idle
+            $0.completionStage = .initial
+        }
+    }
+
     // MARK: - aiProcessingCompleted
 
     /// aiProcessingCompletedの初期値がfalseであること
     func test_aiProcessingCompleted_初期値がfalseであること() {
         let state = RecordingFeature.State()
         XCTAssertEqual(state.aiProcessingCompleted, false)
+    }
+
+    /// AI整理完了通知（トースト表示中）→「整えました」の余韻後にトーストが自動で閉じる
+    func test_aiProcessingCompleted_saved状態_余韻後にトーストが閉じる() async {
+        let memo = VoiceMemoEntity(
+            id: UUID(),
+            title: "テストメモ",
+            audioFilePath: "/Documents/Audio/test.m4a"
+        )
+        let clock = TestClock()
+        let store = TestStore(
+            initialState: RecordingFeature.State(
+                recordingStatus: .saved(memo),
+                completionStage: .cta
+            )
+        ) {
+            RecordingFeature()
+        } withDependencies: {
+            $0.continuousClock = clock
+        }
+
+        await store.send(.aiProcessingCompleted) {
+            $0.aiProcessingCompleted = true
+        }
+
+        await clock.advance(by: RecordingFeature.completionToastLingerDuration)
+
+        await store.receive(.dismissCompletion) {
+            $0.recordingStatus = .idle
+            $0.completionStage = .initial
+            $0.aiProcessingCompleted = false
+        }
+    }
+
+    /// トースト非表示（idle）でAI整理完了通知を受けてもフラグ更新のみで何も起きない
+    func test_aiProcessingCompleted_idle状態_フラグ更新のみ() async {
+        let store = TestStore(
+            initialState: RecordingFeature.State()
+        ) {
+            RecordingFeature()
+        }
+
+        await store.send(.aiProcessingCompleted) {
+            $0.aiProcessingCompleted = true
+        }
     }
 
     // MARK: - 正常系: timerTicked → 最大時間到達で自動停止
